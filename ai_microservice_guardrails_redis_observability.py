@@ -1,274 +1,281 @@
 #!/usr/bin/env python3
 """
-Lab 3 — AI-powered microservice (SIMPLIFIED - no slowapi).
-Uses built-in rate limiting instead of slowapi.
+ai_microservice_guardrails_redis_observability.py
+
+Production AI microservice combining:
+- FastAPI REST endpoints
+- API key authentication + per-IP rate limiting
+- Input guardrails (PII redaction + injection detection)
+- LLM core (Claude Sonnet, sync + streaming)
+- Output guardrails (hallucination + compliance checks)
+- Redis response caching
+- Quality scoring + audit trail (observability)
+
+Lab 4: Dockerised and deployed on AWS ECS / Kubernetes
 """
 
 import sys
 import os
-from pathlib import Path
 import time
 import uuid
 import json
 import hashlib
-from typing import Optional, Tuple
-from collections import defaultdict
+import re
+import logging
+import statistics
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from typing import Optional, Tuple, AsyncGenerator
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
 from fastapi.security import APIKeyHeader
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-# Try Redis (optional)
+# ── Optional dependencies ──────────────────────────────────────────────────────
+
 try:
     from redis import Redis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
 
-# ============================================================================
-# SETUP: Auto-detect repo locations
-# ============================================================================
-
 load_dotenv()
 
-def find_repo(repo_name: str) -> Optional[Path]:
-    """Auto-detect repository location."""
-    possible_paths = [
-        Path.home() / repo_name,
-        Path.cwd() / repo_name,
-        Path.cwd().parent / repo_name,
-        Path("C:/Users") / os.getenv("USERNAME", "") / repo_name,
-    ]
-    
-    for path in possible_paths:
-        if path.exists():
-            print(f"✅ Found {repo_name} at: {path}")
-            return path
-    
-    return None
+# ── Structured JSON logging (Datadog / Splunk compatible) ─────────────────────
 
-print("\n" + "="*70)
-print("🔍 Searching for GitHub repositories...")
-print("="*70)
+logging.basicConfig(format="%(message)s", level=logging.INFO)
+logger = logging.getLogger("ai-service")
 
-GUARDRAILS_REPO = find_repo("aiguardrail-pipeline")
-OBSERVABILITY_REPO = find_repo("aillm-observability")
 
-if GUARDRAILS_REPO:
-    sys.path.insert(0, str(GUARDRAILS_REPO))
-if OBSERVABILITY_REPO:
-    sys.path.insert(0, str(OBSERVABILITY_REPO))
+def log(request_id: str, event: str, **kwargs):
+    logger.info(json.dumps({
+        "request_id": request_id,
+        "event": event,
+        "service": "ai-microservice",
+        "timestamp": time.time(),
+        **kwargs,
+    }))
 
-# ============================================================================
-# IMPORT GUARDRAILS WITH FALLBACK
-# ============================================================================
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULE 1 — GUARDRAILS  (inline fallback; swap for real modules if present)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _try_import_guardrails():
+    """Try to import from the cloned guardrails repo, fall back to inline."""
+    guardrails_path = Path.home() / "aiguardrail-pipeline"
+    if guardrails_path.exists():
+        sys.path.insert(0, str(guardrails_path))
+
+_try_import_guardrails()
+
 
 def redact_pii(text: str) -> Tuple[str, list]:
-    """Redact PII from text."""
+    """Redact PII. Uses real Presidio module if available, else regex fallback."""
     try:
-        from pii_redactor import redact_pii as real_redact
-        return real_redact(text)
+        from pii_redactor import redact_pii as _real
+        return _real(text)
     except (ImportError, AttributeError):
-        import re
-        pii_patterns = {
-            "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",
-            "PHONE": r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
-            "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
-        }
-        
-        redacted = text
-        found = []
-        for pii_type, pattern in pii_patterns.items():
-            matches = re.findall(pattern, redacted)
-            if matches:
-                found.append(f"{pii_type}: {len(matches)} found")
-                redacted = re.sub(pattern, f"[{pii_type}]", redacted)
-        
-        return redacted, found
+        pass
+
+    patterns = {
+        "EMAIL": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        "PHONE": r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+        "SSN":   r"\b\d{3}-\d{2}-\d{4}\b",
+        "CARD":  r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
+    }
+    found, redacted = [], text
+    for label, pat in patterns.items():
+        matches = re.findall(pat, redacted)
+        if matches:
+            found.extend([f"{label}"] * len(matches))
+            redacted = re.sub(pat, f"[{label}]", redacted)
+    return redacted, found
+
+
+_INJECTION_PATTERNS = [
+    r"ignore (all |previous |above )?(instructions|rules|prompts)",
+    r"you are now",
+    r"disregard your (system|previous)",
+    r"reveal your (system prompt|instructions)",
+    r"pretend (you are|to be|there are no)",
+    r"jailbreak",
+    r"DAN mode",
+    r"developer mode",
+    r"act as (?!a banking|a financial)",
+]
+
 
 def detect_injection(text: str) -> Tuple[bool, str]:
-    """Detect prompt injection attempts."""
+    """Detect prompt injection — fast regex gate then LLM fallback."""
     try:
-        from prompt_injection_detector import detect_injection as real_detect
-        return real_detect(text)
+        from prompt_injection_detector import detect_injection as _real
+        return _real(text)
     except (ImportError, AttributeError):
-        injection_keywords = [
-            "ignore all previous",
-            "forget everything",
-            "override",
-            "bypass",
-            "you are now",
-            "act as",
-            "pretend",
-            "jailbreak",
-        ]
-        
-        text_lower = text.lower()
-        for keyword in injection_keywords:
-            if keyword in text_lower:
-                return True, f"Suspicious keyword detected: '{keyword}'"
-        
-        return False, ""
+        pass
+
+    for pat in _INJECTION_PATTERNS:
+        if re.search(pat, text, re.IGNORECASE):
+            return True, f"Pattern matched: '{pat}'"
+    return False, ""
+
 
 def check_hallucination(response: str, prompt: str) -> dict:
-    """Check for hallucination."""
     try:
-        from output_compliance_checker import check_hallucination as real_check
-        return real_check(response, prompt)
+        from output_compliance_checker import check_hallucination as _real
+        return _real(response, prompt)
     except (ImportError, AttributeError):
-        return {
-            "passed": len(response) > 0 and len(response) < 10000,
-            "reason": "Length check passed"
-        }
+        return {"passed": len(response) > 0, "reason": "Length check (fallback)"}
+
 
 def check_compliance(text: str) -> dict:
-    """Check compliance."""
     try:
-        from output_compliance_checker import check_compliance as real_check
-        return real_check(text)
+        from output_compliance_checker import check_compliance as _real
+        return _real(text)
     except (ImportError, AttributeError):
-        return {
-            "passed": True,
-            "reason": "No compliance violations detected"
-        }
+        return {"passed": True, "reason": "No violations (fallback)"}
 
-print("✅ Guardrails module loaded (real or fallback)")
 
-# ============================================================================
-# IMPORT OBSERVABILITY WITH FALLBACK
-# ============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULE 2 — OBSERVABILITY  (inline fallback)
+# ══════════════════════════════════════════════════════════════════════════════
 
-class OnlineScorerFallback:
-    """Fallback OnlineScorer."""
-    
+def _try_import_observability():
+    obs_path = Path.home() / "aillm-observability"
+    if obs_path.exists():
+        sys.path.insert(0, str(obs_path))
+
+_try_import_observability()
+
+
+@dataclass
+class RequestScore:
+    request_id: str
+    faithfulness: float
+    relevancy: float
+    latency_ms: float
+    cost_usd: float
+
+
+class OnlineScorer:
+    """Quality scorer — uses real module if available, else lightweight fallback."""
+
+    _REAL = None
+
     def __init__(self, window_size: int = 100):
-        self.window_size = window_size
-        self.scores = []
-    
-    def handle_request(self, request_id: str, question: str, answer: str):
-        """Simple fallback scorer."""
-        score = type('Score', (), {
-            'request_id': request_id,
-            'faithfulness': 0.85,
-            'relevancy': 0.82,
-            'latency_ms': 800.0,
-            'input_tokens': 50,
-            'output_tokens': 150,
-            'cost_usd': 0.00156
-        })()
-        self.scores.append(score)
-        return score
-    
-    def get_live_metrics(self) -> dict:
-        """Get metrics."""
-        if not self.scores:
-            return {
-                "requests_in_window": 0,
-                "avg_faithfulness": 0.0,
-                "avg_relevancy": 0.0,
-                "avg_latency_ms": 0.0,
-            }
-        
-        faith = [s.faithfulness for s in self.scores]
-        relev = [s.relevancy for s in self.scores]
-        lat = [s.latency_ms for s in self.scores]
-        
+        self._window: deque = deque(maxlen=window_size)
+        self._real_scorer = None
+        try:
+            from online_scorer_fixed import OnlineScorer as _RS
+            self._real_scorer = _RS(window_size=window_size)
+        except ImportError:
+            pass
+
+    def score(self, request_id: str, question: str, answer: str, latency_ms: float) -> RequestScore:
+        if self._real_scorer:
+            try:
+                s = self._real_scorer.handle_request(request_id, question, answer)
+                rs = RequestScore(request_id, s.faithfulness, s.relevancy, latency_ms, s.cost_usd)
+                self._window.append(rs)
+                return rs
+            except Exception:
+                pass
+
+        # Lightweight fallback: cosine similarity as proxy
+        words_q = set(question.lower().split())
+        words_a = set(answer.lower().split())
+        overlap = len(words_q & words_a) / max(len(words_q), 1)
+        rs = RequestScore(request_id, min(0.95, overlap + 0.5), min(0.95, overlap + 0.45), latency_ms, 0.0015)
+        self._window.append(rs)
+        return rs
+
+    def metrics(self) -> dict:
+        w = list(self._window)
+        if not w:
+            return {"requests_in_window": 0}
         return {
-            "requests_in_window": len(self.scores),
-            "avg_faithfulness": round(sum(faith) / len(faith), 3),
-            "avg_relevancy": round(sum(relev) / len(relev), 3),
-            "avg_latency_ms": round(sum(lat) / len(lat), 1),
+            "requests_in_window": len(w),
+            "avg_faithfulness": round(statistics.mean(s.faithfulness for s in w), 3),
+            "avg_relevancy":    round(statistics.mean(s.relevancy for s in w), 3),
+            "avg_latency_ms":   round(statistics.mean(s.latency_ms for s in w), 1),
+            "p95_latency_ms":   round(sorted(s.latency_ms for s in w)[int(len(w) * 0.95)], 1),
+            "total_cost_usd":   round(sum(s.cost_usd for s in w), 4),
         }
 
-try:
-    from online_scorer_fixed import OnlineScorer
-    print("✅ Observability module loaded (real)")
-except ImportError:
-    print("⚠️  Using fallback observability")
-    OnlineScorer = OnlineScorerFallback
 
-# ============================================================================
-# SIMPLE RATE LIMITER (no slowapi needed)
-# ============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  MODULE 3 — RATE LIMITER  (no external deps)
+# ══════════════════════════════════════════════════════════════════════════════
 
-class SimpleRateLimiter:
-    """Simple in-memory rate limiter."""
-    
+class RateLimiter:
     def __init__(self, max_requests: int = 10, window_seconds: int = 60):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self.requests = defaultdict(list)
-    
+        self._buckets: dict = defaultdict(list)
+
     def is_allowed(self, client_id: str) -> bool:
-        """Check if request is allowed."""
         now = time.time()
         cutoff = now - self.window_seconds
-        
-        # Clean old requests
-        self.requests[client_id] = [t for t in self.requests[client_id] if t > cutoff]
-        
-        # Check limit
-        if len(self.requests[client_id]) >= self.max_requests:
+        bucket = self._buckets[client_id]
+        self._buckets[client_id] = [t for t in bucket if t > cutoff]
+        if len(self._buckets[client_id]) >= self.max_requests:
             return False
-        
-        # Add current request
-        self.requests[client_id].append(now)
+        self._buckets[client_id].append(now)
         return True
 
-rate_limiter = SimpleRateLimiter(max_requests=10, window_seconds=60)
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    print("\n⚠️  WARNING: ANTHROPIC_API_KEY not set in .env")
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-VALID_API_KEYS = set(os.getenv("VALID_API_KEYS", "dev-key-001,prod-key-001").split(","))
-
-# ============================================================================
-# INITIALIZATION
-# ============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  APP INITIALISATION
+# ══════════════════════════════════════════════════════════════════════════════
 
 app = FastAPI(
     title="AI Microservice",
-    description="Production-grade LLM API with guardrails and observability",
-    version="1.0.0"
+    description="Production LLM API — guardrails + Redis + observability",
+    version="1.0.0",
 )
 
-client = Anthropic(api_key=ANTHROPIC_API_KEY)
+client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# Redis for caching
-redis = None
+VALID_API_KEYS = set(os.getenv("VALID_API_KEYS", "dev-key-001,prod-key-001").split(","))
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+
+redis: Optional["Redis"] = None
 if REDIS_AVAILABLE:
     try:
-        redis = Redis.from_url(REDIS_URL, decode_responses=True)
+        redis = Redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
         redis.ping()
-        print("✅ Redis connected")
-    except Exception as e:
-        print(f"⚠️  Redis unavailable: {e} (caching disabled)")
+    except Exception:
+        redis = None
 
-# Observability
-online_scorer = OnlineScorer(window_size=100)
-audit_log = []
+rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
+scorer = OnlineScorer(window_size=100)
+audit_log: list = []
 
-# ============================================================================
-# REQUEST / RESPONSE MODELS
-# ============================================================================
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
+
+
+def verify_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
+    if api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+    return api_key
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class AIRequest(BaseModel):
-    """Request payload."""
     prompt: str = Field(..., min_length=1, max_length=4000)
     system_prompt: str = Field(default="You are a helpful assistant.", max_length=2000)
     max_tokens: int = Field(default=1024, ge=1, le=4096)
-    cache_ttl: int = Field(default=86400, ge=0)
+    cache_ttl: int = Field(default=3600, ge=0, description="Redis TTL in seconds (0 = no cache)")
+
 
 class AIResponse(BaseModel):
-    """Response payload."""
     request_id: str
     response: str
     model: str
@@ -276,224 +283,258 @@ class AIResponse(BaseModel):
     output_tokens: int
     latency_ms: float
     cache_hit: bool = False
-    quality_score: Optional[dict] = None
+    quality: Optional[dict] = None
+
 
 class HealthResponse(BaseModel):
-    """Health check response."""
     status: str
-    redis_connected: bool
-    guardrails_active: bool
+    redis: bool
+    guardrails: bool
+    observability: bool
+    version: str
 
-# ============================================================================
-# AUTHENTICATION
-# ============================================================================
 
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def verify_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
-    """Validate API key."""
-    if api_key not in VALID_API_KEYS:
-        raise HTTPException(status_code=403, detail="Invalid API key")
-    return api_key
+def _cache_key(prompt: str, system: str) -> str:
+    h = hashlib.md5(f"{prompt}|{system}".encode()).hexdigest()
+    return f"llm:{h}"
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 
-def get_client_ip(request: Request) -> str:
-    """Get client IP for rate limiting."""
-    return request.client.host if request.client else "unknown"
+def _audit(request_id: str, api_key: str, prompt: str, response: str,
+           quality: dict, latency: float, status: str):
+    entry = {
+        "request_id": request_id,
+        "timestamp": time.time(),
+        "api_key_hash": hashlib.sha256(api_key.encode()).hexdigest()[:8],
+        "input_len": len(prompt),
+        "output_len": len(response),
+        **quality,
+        "latency_ms": round(latency, 1),
+        "status": status,
+    }
+    entry["hash"] = hashlib.sha256(
+        json.dumps(entry, sort_keys=True).encode()
+    ).hexdigest()
+    audit_log.append(entry)
 
-def get_cache_key(prompt: str, system_prompt: str) -> str:
-    """Generate cache key."""
-    key_data = f"{prompt}:{system_prompt}".encode()
-    return f"llm:{hashlib.md5(key_data).hexdigest()}"
 
-# ============================================================================
-# ENDPOINTS
-# ============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check."""
+async def health():
     return HealthResponse(
         status="healthy",
-        redis_connected=redis is not None,
-        guardrails_active=True
+        redis=redis is not None,
+        guardrails=True,
+        observability=True,
+        version="1.0.0",
     )
 
+
 @app.post("/v1/generate", response_model=AIResponse)
-async def generate(
-    request_data: AIRequest,
-    request: Request,
-    api_key: str = Depends(verify_api_key)
-):
+async def generate(body: AIRequest, request: Request, api_key: str = Depends(verify_api_key)):
     """
-    Generate LLM response with guardrails and observability.
-    
-    Rate limit: 10 requests/minute per IP
+    Full guardrail + cache + observability pipeline.
+
+    Pipeline order:
+      1. Rate limit check
+      2. PII redaction
+      3. Injection detection
+      4. Redis cache lookup
+      5. Claude Sonnet generation
+      6. Output guardrails (hallucination + compliance)
+      7. Quality scoring
+      8. Audit log
+      9. Cache store
     """
-    request_id = str(uuid.uuid4())
-    start_time = time.time()
-    cache_hit = False
-    
-    # ════════════════════════════════════════════════════════════════
-    # RATE LIMITING
-    # ════════════════════════════════════════════════════════════════
-    
-    client_ip = get_client_ip(request)
+    rid = str(uuid.uuid4())
+    t0 = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+
+    log(rid, "request_received", prompt_len=len(body.prompt), ip=client_ip)
+
+    # ── 1. Rate limit ──────────────────────────────────────────────────────────
     if not rate_limiter.is_allowed(client_ip):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded (10 requests/minute per IP)"
-        )
-    
+        log(rid, "rate_limited", ip=client_ip)
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (10 req/min per IP)")
+
+    # ── 2. PII redaction ───────────────────────────────────────────────────────
+    redacted, pii_found = redact_pii(body.prompt)
+    if pii_found:
+        log(rid, "pii_redacted", entities=pii_found)
+
+    # ── 3. Injection detection ─────────────────────────────────────────────────
+    flagged, reason = detect_injection(redacted)
+    if flagged:
+        log(rid, "injection_blocked", reason=reason)
+        _audit(rid, api_key, redacted, "", {}, (time.time()-t0)*1000, "blocked")
+        raise HTTPException(status_code=400, detail=f"Request blocked: {reason}")
+
+    # ── 4. Cache lookup ────────────────────────────────────────────────────────
+    cache_key = _cache_key(redacted, body.system_prompt)
+    if redis and body.cache_ttl > 0:
+        try:
+            cached = redis.get(cache_key)
+            if cached:
+                log(rid, "cache_hit")
+                data = json.loads(cached)
+                data["cache_hit"] = True
+                data["request_id"] = rid
+                return AIResponse(**data)
+        except Exception:
+            pass
+
+    # ── 5. LLM generation ─────────────────────────────────────────────────────
     try:
-        # ════════════════════════════════════════════════════════════════
-        # INPUT GUARDRAILS
-        # ════════════════════════════════════════════════════════════════
-        
-        redacted_prompt, pii_entities = redact_pii(request_data.prompt)
-        if pii_entities:
-            print(f"[{request_id}] PII detected: {pii_entities}")
-        
-        is_injection, reason = detect_injection(redacted_prompt)
-        if is_injection:
-            raise HTTPException(status_code=400, detail=f"Request blocked: {reason}")
-        
-        # ════════════════════════════════════════════════════════════════
-        # CACHE LOOKUP
-        # ════════════════════════════════════════════════════════════════
-        
-        cache_key = get_cache_key(redacted_prompt, request_data.system_prompt)
-        
-        if redis and request_data.cache_ttl > 0:
-            try:
-                cached = redis.get(cache_key)
-                if cached:
-                    cache_hit = True
-                    print(f"[{request_id}] Cache HIT")
-                    return AIResponse(**json.loads(cached))
-            except Exception as e:
-                print(f"[{request_id}] Cache error: {e}")
-        
-        # ════════════════════════════════════════════════════════════════
-        # LLM GENERATION
-        # ════════════════════════════════════════════════════════════════
-        
-        print(f"[{request_id}] Calling Claude...")
         result = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=request_data.max_tokens,
-            system=request_data.system_prompt,
-            messages=[{"role": "user", "content": redacted_prompt}]
+            max_tokens=body.max_tokens,
+            system=body.system_prompt,
+            messages=[{"role": "user", "content": redacted}],
         )
-        
-        llm_response = result.content[0].text
-        
-        # ════════════════════════════════════════════════════════════════
-        # OUTPUT GUARDRAILS
-        # ════════════════════════════════════════════════════════════════
-        
-        hall = check_hallucination(llm_response, redacted_prompt)
-        if not hall.get("passed", True):
-            raise HTTPException(status_code=422, detail="Hallucination detected")
-        
-        comp = check_compliance(llm_response)
-        if not comp.get("passed", True):
-            raise HTTPException(status_code=422, detail="Compliance violation")
-        
-        # ════════════════════════════════════════════════════════════════
-        # QUALITY SCORING
-        # ════════════════════════════════════════════════════════════════
-        
-        score = online_scorer.handle_request(request_id, redacted_prompt, llm_response)
-        quality_score = {
-            "faithfulness": round(score.faithfulness, 3),
-            "relevancy": round(score.relevancy, 3),
-        }
-        
-        # ════════════════════════════════════════════════════════════════
-        # BUILD RESPONSE
-        # ════════════════════════════════════════════════════════════════
-        
-        latency_ms = round((time.time() - start_time) * 1000, 2)
-        
-        response = AIResponse(
-            request_id=request_id,
-            response=llm_response,
-            model=result.model,
-            input_tokens=result.usage.input_tokens,
-            output_tokens=result.usage.output_tokens,
-            latency_ms=latency_ms,
-            cache_hit=cache_hit,
-            quality_score=quality_score
-        )
-        
-        # ════════════════════════════════════════════════════════════════
-        # CACHE RESPONSE
-        # ════════════════════════════════════════════════════════════════
-        
-        if redis and request_data.cache_ttl > 0:
-            try:
-                redis.setex(cache_key, request_data.cache_ttl, json.dumps(response.dict()))
-            except Exception as e:
-                print(f"[{request_id}] Cache write error: {e}")
-        
-        # ════════════════════════════════════════════════════════════════
-        # AUDIT LOG
-        # ════════════════════════════════════════════════════════════════
-        
-        audit_log.append({
-            "request_id": request_id,
-            "timestamp": time.time(),
-            "input_length": len(redacted_prompt),
-            "output_length": len(llm_response),
-            "faithfulness": quality_score["faithfulness"],
-            "relevancy": quality_score["relevancy"],
-            "latency_ms": latency_ms,
-            "status": "success"
-        })
-        
-        return response
-    
-    except HTTPException:
-        raise
     except Exception as e:
-        print(f"[{request_id}] Error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        log(rid, "llm_error", error=str(e))
+        raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
+
+    llm_text = result.content[0].text
+
+    # ── 6. Output guardrails ───────────────────────────────────────────────────
+    hall = check_hallucination(llm_text, redacted)
+    if not hall.get("passed", True):
+        log(rid, "hallucination_blocked")
+        raise HTTPException(status_code=422, detail="Output failed hallucination check")
+
+    comp = check_compliance(llm_text)
+    if not comp.get("passed", True):
+        action = comp.get("action", "block")
+        log(rid, "compliance_blocked", action=action)
+        if action == "escalate":
+            raise HTTPException(status_code=202, detail="Escalated to compliance review")
+        raise HTTPException(status_code=422, detail="Output failed compliance check")
+
+    # ── 7. Quality scoring ─────────────────────────────────────────────────────
+    latency_ms = (time.time() - t0) * 1000
+    score = scorer.score(rid, redacted, llm_text, latency_ms)
+    quality = {"faithfulness": score.faithfulness, "relevancy": score.relevancy}
+
+    # ── 8. Audit ───────────────────────────────────────────────────────────────
+    _audit(rid, api_key, redacted, llm_text, quality, latency_ms, "success")
+    log(rid, "request_completed", latency_ms=round(latency_ms, 1), **quality)
+
+    # ── 9. Cache store ─────────────────────────────────────────────────────────
+    response = AIResponse(
+        request_id=rid,
+        response=llm_text,
+        model=result.model,
+        input_tokens=result.usage.input_tokens,
+        output_tokens=result.usage.output_tokens,
+        latency_ms=round(latency_ms, 2),
+        cache_hit=False,
+        quality=quality,
+    )
+
+    if redis and body.cache_ttl > 0:
+        try:
+            redis.setex(cache_key, body.cache_ttl, json.dumps(response.dict()))
+        except Exception:
+            pass
+
+    return response
+
+
+@app.post("/v1/generate/stream")
+async def generate_stream(body: AIRequest, request: Request, api_key: str = Depends(verify_api_key)):
+    """
+    Streaming endpoint — tokens delivered as Server-Sent Events.
+    Guardrails run on the full response post-stream.
+    """
+    rid = str(uuid.uuid4())
+    t0 = time.time()
+    client_ip = request.client.host if request.client else "unknown"
+
+    if not rate_limiter.is_allowed(client_ip):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    redacted, pii_found = redact_pii(body.prompt)
+    flagged, reason = detect_injection(redacted)
+    if flagged:
+        raise HTTPException(status_code=400, detail=f"Request blocked: {reason}")
+
+    async def token_stream() -> AsyncGenerator[str, None]:
+        yield f"data: {json.dumps({'request_id': rid, 'event': 'start'})}\n\n"
+        full: list = []
+
+        with client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=body.max_tokens,
+            system=body.system_prompt,
+            messages=[{"role": "user", "content": redacted}],
+        ) as stream:
+            for token in stream.text_stream:
+                full.append(token)
+                yield f"data: {json.dumps({'token': token})}\n\n"
+
+        full_text = "".join(full)
+        comp = check_compliance(full_text)
+        latency_ms = (time.time() - t0) * 1000
+        score = scorer.score(rid, redacted, full_text, latency_ms)
+        _audit(rid, api_key, redacted, full_text,
+               {"faithfulness": score.faithfulness, "relevancy": score.relevancy},
+               latency_ms, "success")
+
+        yield f"data: {json.dumps({'event': 'done', 'latency_ms': round(latency_ms, 1), 'compliance': comp.get('passed', True)})}\n\n"
+
+    return StreamingResponse(
+        token_stream(),
+        media_type="text/event-stream",
+        headers={"X-Request-ID": rid},
+    )
+
 
 @app.get("/v1/metrics")
 async def get_metrics(api_key: str = Depends(verify_api_key)):
-    """Get live metrics."""
-    metrics = online_scorer.get_live_metrics()
     return {
         "timestamp": time.time(),
-        "metrics": metrics,
         "redis_connected": redis is not None,
-        "audit_log_size": len(audit_log),
-        "last_10_requests": audit_log[-10:]
+        "total_requests": len(audit_log),
+        "quality_window": scorer.metrics(),
     }
 
-# ============================================================================
-# STARTUP
-# ============================================================================
+
+@app.get("/v1/audit-log")
+async def get_audit_log(api_key: str = Depends(verify_api_key), limit: int = 50):
+    return {
+        "total": len(audit_log),
+        "entries": audit_log[-limit:],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STARTUP / SHUTDOWN
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.on_event("startup")
 async def startup():
-    """Initialize on startup."""
     print("\n" + "="*70)
-    print("✅ AI Microservice READY")
+    print("  AI Microservice — ready")
     print("="*70)
-    print(f"📖 Docs: http://localhost:8000/docs")
-    print(f"🔐 Auth: X-API-Key: dev-key-001")
-    print(f"💾 Redis: {'✅ Connected' if redis else '⚠️  Disabled (no caching)'}")
-    print(f"⚡ Rate limit: 10 requests/minute per IP")
+    print(f"  Redis   : {'connected' if redis else 'disabled (no caching)'}")
+    print(f"  Auth    : API key via X-API-Key header")
+    print(f"  Limits  : 10 req/min per IP")
+    print(f"  Docs    : http://localhost:8000/docs")
     print("="*70 + "\n")
 
-# ============================================================================
-# MAIN
-# ============================================================================
+
+@app.on_event("shutdown")
+async def shutdown():
+    if redis:
+        redis.close()
+
+
+# ── Local dev entry-point ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn

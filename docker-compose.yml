@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+
+  # ── AI Microservice ──────────────────────────────────────────────────────────
+  ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-microservice
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - REDIS_URL=redis://redis:6379
+      - VALID_API_KEYS=${VALID_API_KEYS:-dev-key-001,prod-key-001}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ai-network
+    volumes:
+      # Mount cloned repos into the container (optional — for real module imports)
+      - ${USERPROFILE:-~}/aiguardrail-pipeline:/root/aiguardrail-pipeline:ro
+      - ${USERPROFILE:-~}/aillm-observability:/root/aillm-observability:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ai-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    networks:
+      - ai-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Redis Commander (optional UI) ─────────────────────────────────────────────
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis-ui
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - ai-network
+    profiles:
+      - debug      # only starts with: docker compose --profile debug up
+
+networks:
+  ai-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
