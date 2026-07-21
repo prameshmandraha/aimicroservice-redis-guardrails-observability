@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: ai-microservice
+
+resources:
+  - ../../base
+  - ingress.yaml
+
+# On managed K8s you have two common options for external access:
+#  1. Ingress (above) fronted by an nginx/ALB/GCE ingress controller — recommended.
+#  2. Or switch the ai-service Service type to LoadBalancer for a quick
+#     cloud-provisioned external IP without an ingress controller:
+#       kubectl patch svc ai-service -n ai-microservice -p '{"spec":{"type":"LoadBalancer"}}'
