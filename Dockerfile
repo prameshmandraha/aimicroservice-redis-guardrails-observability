@@ -11,7 +11,8 @@ RUN pip install --upgrade pip \
 FROM python:3.11-slim
 
 # Security: run as non-root
-RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+#RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+RUN addgroup --system --gid 1000 appgroup && adduser --system --uid 1000 --ingroup appgroup appuser
 
 WORKDIR /app
 
