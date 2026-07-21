@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-service-ingress
+  namespace: ai-microservice
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # cert-manager.io/cluster-issuer: letsencrypt-prod   # uncomment once TLS is set up
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: ai-microservice.example.com   # replace with your real domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-service
+                port:
+                  number: 8000
+  # tls:
+  #   - hosts:
+  #       - ai-microservice.example.com
+  #     secretName: ai-microservice-tls
