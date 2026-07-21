@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-service-config
+  namespace: ai-microservice
+data:
+  REDIS_URL: "redis://redis-service:6379"
+  VALID_API_KEYS: "dev-key-001,prod-key-001"
